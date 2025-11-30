@@ -3,15 +3,23 @@
 # Author: Linda Mthembu
 
 from pathlib import Path
+from typing import Tuple
 
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
 
-# ---------- Config ----------
-DATA_PATH = Path("data") / "uber-raw-data.csv"
-DATE_COL = "DateTime"   # single canonical datetime column
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
+# Always resolve the data path relative to this file,
+# so it works even if you run Streamlit from another folder.
+APP_ROOT = Path(__file__).parent
+DATA_PATH = APP_ROOT / "data" / "uber-raw-data.csv"
+
+# Candidate datetime column names we can recognise
+DATETIME_CANDIDATES = ["Date/Time", "DateTime", "Pickup_date", "Pickup_Date"]
 
 st.set_page_config(
     page_title="Uber NYC 2015 – Data Analysis",
@@ -19,148 +27,282 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🚕 Uber NYC 2015 – Interactive Data Explorer")
-st.write(
-    """
-    This app showcases my end-to-end exploratory data analysis of Uber trip data
-    in New York City (2014–2015). Use the controls in the sidebar to filter the
-    data and explore demand patterns.
-    """
-)
+# -------------------------------------------------------------------
+# LOAD DATA
+# -------------------------------------------------------------------
+@st.cache_data(show_spinner="Loading trip data…")
+def load_data() -> Tuple[pd.DataFrame, str]:
+    """Load the sample CSV and return (dataframe, datetime_column_name)."""
 
-# ---------- Load data ----------
-@st.cache_data
-def load_data() -> pd.DataFrame:
+    # 1. Basic file checks
+    if not DATA_PATH.exists():
+        st.error(
+            f"Data file **{DATA_PATH}** was not found.\n\n"
+            "Re-run the Jupyter notebook cell that exports "
+            "`uber-raw-data.csv` and then refresh this app."
+        )
+        st.stop()
+
+    if DATA_PATH.stat().st_size == 0:
+        st.error(
+            f"**{DATA_PATH}** exists but is empty.\n\n"
+            "Regenerate the file from your notebook (export a sample to "
+            "`data/uber-raw-data.csv`) and refresh the app."
+        )
+        st.stop()
+
     df = pd.read_csv(DATA_PATH)
 
-    # 1. Ensure we have a single datetime column
-    if DATE_COL not in df.columns:
-        if {"DATE", "TIME"}.issubset(df.columns):
-            # build a datetime string and parse
-            dt_str = df["DATE"].astype(str) + " " + df["TIME"].astype(str)
-            df[DATE_COL] = pd.to_datetime(dt_str, errors="coerce")
-        else:
-            st.error(
-                "Could not find a usable date/time column. "
-                f"Columns available: {df.columns.tolist()}"
-            )
-            st.stop()
-    else:
-        df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    # 2. Find a usable datetime column
+    date_col = None
+    for c in DATETIME_CANDIDATES:
+        if c in df.columns:
+            date_col = c
+            break
 
-    # drop rows where datetime is missing to avoid date vs float issues
-    df = df.dropna(subset=[DATE_COL])
+    # Fallback: build from DATE + TIME if they both exist
+    if date_col is None and {"DATE", "TIME"}.issubset(df.columns):
+        dt_str = df["DATE"].astype(str) + " " + df["TIME"].astype(str)
+        date_col = "DateTime"
+        df[date_col] = pd.to_datetime(dt_str, errors="coerce")
 
-    # 2. Create features the app expects
-    df["date"] = df[DATE_COL].dt.date
-    df["hour"] = df[DATE_COL].dt.hour
-    df["weekday"] = df[DATE_COL].dt.day_name()
+    if date_col is None:
+        st.error(
+            "Could not find a usable date/time column. "
+            f"Columns available: {df.columns.tolist()}"
+        )
+        st.stop()
 
-    # 3. Normalise the base column name
+    # 3. Parse and engineer common time features
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col])
+
+    df["date"] = df[date_col].dt.date
+    df["hour"] = df[date_col].dt.hour
+    df["weekday"] = df[date_col].dt.day_name()
+
+    # Normalise Base column if needed
     if "Base" not in df.columns and "Base Number" in df.columns:
         df = df.rename(columns={"Base Number": "Base"})
 
-    # 4. Make sure Lat/Lon are numeric if present (for the map)
-    for col in ["Lat", "Lon"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
+    return df, date_col
 
 
-df = load_data()
+df, DATE_COL = load_data()
 
-# ---------- Sidebar filters ----------
-st.sidebar.header("Filters")
+# -------------------------------------------------------------------
+# PAGE HEADER
+# -------------------------------------------------------------------
+st.title("🚕 Uber NYC 2015 – Interactive Data Explorer")
 
-# Date range – work with clean, non-null dates
-valid_dates = df[DATE_COL].dt.date.dropna()
-min_date = valid_dates.min()
-max_date = valid_dates.max()
-
-date_range = st.sidebar.date_input(
-    "Date range",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
+st.write(
+    """
+    This dashboard presents an exploratory analysis of Uber trip data in New York City.
+    Use the filters on the left to slice the data by date range and hour of day, and
+    review the automated insights beneath each chart.
+    """
 )
 
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_date, end_date = date_range
-else:
-    start_date = end_date = date_range
+# -------------------------------------------------------------------
+# SIDEBAR – FILTERS
+# -------------------------------------------------------------------
+with st.sidebar:
+    st.header("Filters")
 
-date_mask = df[DATE_COL].dt.date.between(start_date, end_date)
+    # Show available columns (for transparency / debugging)
+    with st.expander("Show columns in dataset"):
+        st.write(list(df.columns))
 
-filtered = df.loc[date_mask].copy()
+    valid_dates = df[DATE_COL].dt.date
+    min_date = valid_dates.min()
+    max_date = valid_dates.max()
 
-# Hour filter
-hour_range = st.sidebar.slider("Hour of day", 0, 23, (0, 23))
-h_min, h_max = hour_range
-filtered = filtered[(filtered["hour"] >= h_min) & (filtered["hour"] <= h_max)]
+    date_range = st.date_input(
+        "Date range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
 
-st.sidebar.write(f"Rows after filtering: **{len(filtered):,}**")
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date = end_date = date_range
 
-# ---------- KPIs ----------
+    date_mask = df[DATE_COL].dt.date.between(start_date, end_date)
+
+    hour_range = st.slider("Hour of day", 0, 23, (0, 23))
+    h_min, h_max = hour_range
+
+    filtered = df.loc[date_mask].copy()
+    filtered = filtered[(filtered["hour"] >= h_min) & (filtered["hour"] <= h_max)]
+
+    st.markdown("---")
+    st.write(f"Rows after filtering: **{len(filtered):,}**")
+
+if filtered.empty:
+    st.warning("No trips match the current filter selection. Try widening the filters.")
+    st.stop()
+
+# -------------------------------------------------------------------
+# KPI SUMMARY
+# -------------------------------------------------------------------
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("Total Trips", f"{len(filtered):,}")
+    st.metric("Total Trips (filtered)", f"{len(filtered):,}")
 with col2:
     st.metric("Unique Days", filtered["date"].nunique())
 with col3:
-    if "Base" in filtered.columns:
-        st.metric("Unique Bases", filtered["Base"].nunique())
-    else:
-        st.metric("Unique Bases", "N/A")
+    bases = filtered["Base"].nunique() if "Base" in filtered.columns else "N/A"
+    st.metric("Unique Bases", bases)
 
 st.markdown("---")
 
-# ---------- Trips by hour ----------
-st.subheader("Trips by Hour of Day")
-hour_counts = filtered.groupby("hour").size().reset_index(name="trips")
-fig_hour = px.bar(hour_counts, x="hour", y="trips", labels={"trips": "Number of trips"})
+# -------------------------------------------------------------------
+# 1. TRIPS BY HOUR OF DAY
+# -------------------------------------------------------------------
+st.subheader("Hourly Demand Profile")
+
+hour_counts = (
+    filtered.groupby("hour")
+    .size()
+    .reset_index(name="trips")
+    .sort_values("hour")
+)
+
+fig_hour = px.bar(
+    hour_counts,
+    x="hour",
+    y="trips",
+    labels={"hour": "Hour of day", "trips": "Number of trips"},
+)
 st.plotly_chart(fig_hour, use_container_width=True)
 
-# ---------- Trips by weekday ----------
-st.subheader("Trips by Day of Week")
-weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-weekday_counts = (
-    filtered.groupby("weekday").size().reindex(weekday_order).reset_index(name="trips")
+# Automated insights for hourly profile
+peak_hour_row = hour_counts.loc[hour_counts["trips"].idxmax()]
+off_hour_row = hour_counts.loc[hour_counts["trips"].idxmin()]
+
+peak_hour = int(peak_hour_row["hour"])
+peak_trips = int(peak_hour_row["trips"])
+off_hour = int(off_hour_row["hour"])
+off_trips = int(off_hour_row["trips"])
+
+morning_mask = hour_counts["hour"].between(7, 9)
+evening_mask = hour_counts["hour"].between(16, 19)
+morning_share = hour_counts.loc[morning_mask, "trips"].sum() / hour_counts["trips"].sum()
+evening_share = hour_counts.loc[evening_mask, "trips"].sum() / hour_counts["trips"].sum()
+
+st.markdown(
+    f"""
+**Insights – Hourly Demand**
+
+- Peak activity occurs around **{peak_hour:02d}:00**, with approximately **{peak_trips:,} trips** in the filtered data.
+- The quietest period is around **{off_hour:02d}:00**, with only **{off_trips:,} trips**.
+- Morning commute hours (07:00–09:00) account for about **{morning_share:.1%}** of all filtered trips,
+  while evening commute hours (16:00–19:00) contribute **{evening_share:.1%}**.
+- Together, these commute windows capture the majority of demand, confirming classic
+  **home ↔ work travel patterns**.
+"""
 )
+
+st.markdown("---")
+
+# -------------------------------------------------------------------
+# 2. TRIPS BY DAY OF WEEK
+# -------------------------------------------------------------------
+st.subheader("Demand by Day of Week")
+
+weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+weekday_counts = (
+    filtered.groupby("weekday")
+    .size()
+    .reindex(weekday_order)
+    .reset_index(name="trips")
+)
+
 fig_weekday = px.bar(
     weekday_counts,
     x="weekday",
     y="trips",
-    labels={"trips": "Number of trips"},
+    labels={"weekday": "Day of week", "trips": "Number of trips"},
 )
 st.plotly_chart(fig_weekday, use_container_width=True)
 
-# ---------- Map ----------
-st.subheader("Pickup Locations (sample)")
-if {"Lat", "Lon"}.issubset(filtered.columns):
-    sample = filtered.dropna(subset=["Lat", "Lon"]).sample(
-        min(5000, len(filtered)), random_state=42
+# Automated insights for weekday profile
+valid_weekdays = weekday_counts.dropna(subset=["trips"])
+peak_day_row = valid_weekdays.loc[valid_weekdays["trips"].idxmax()]
+off_day_row = valid_weekdays.loc[valid_weekdays["trips"].idxmin()]
+
+peak_day = peak_day_row["weekday"]
+peak_day_trips = int(peak_day_row["trips"])
+off_day = off_day_row["weekday"]
+off_day_trips = int(off_day_row["trips"])
+
+weekday_mask = valid_weekdays["weekday"].isin(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"])
+weekend_mask = valid_weekdays["weekday"].isin(["Saturday", "Sunday"])
+
+weekday_avg = valid_weekdays.loc[weekday_mask, "trips"].mean()
+weekend_avg = valid_weekdays.loc[weekend_mask, "trips"].mean()
+
+st.markdown(
+    f"""
+**Insights – Weekday vs Weekend**
+
+- The busiest day in the filtered period is **{peak_day}** with roughly **{peak_day_trips:,} trips**.
+- The quietest day is **{off_day}**, with around **{off_day_trips:,} trips**.
+- Average weekday demand is **{weekday_avg:,.0f} trips per day**, compared to
+  **{weekend_avg:,.0f} trips per day** on weekends.
+- This suggests that **weekday commute patterns** dominate overall demand,
+  with weekends showing a more leisure-driven but still substantial volume.
+"""
+)
+
+st.markdown("---")
+
+# -------------------------------------------------------------------
+# 3. BASE ACTIVITY (OPTIONAL, if Base column exists)
+# -------------------------------------------------------------------
+if "Base" in filtered.columns:
+    st.subheader("Dispatch Base Activity")
+
+    base_counts = (
+        filtered.groupby("Base")
+        .size()
+        .reset_index(name="trips")
+        .sort_values("trips", ascending=False)
     )
-    fig_map = px.scatter_mapbox(
-        sample,
-        lat="Lat",
-        lon="Lon",
-        zoom=9,
-        height=500,
-        opacity=0.5,
+
+    fig_base = px.bar(
+        base_counts.head(15),
+        x="Base",
+        y="trips",
+        labels={"Base": "Dispatch base", "trips": "Number of trips"},
     )
-    fig_map.update_layout(
-        mapbox_style="open-street-map",
-        margin=dict(l=0, r=0, t=0, b=0),
+    st.plotly_chart(fig_base, use_container_width=True)
+
+    top_base_row = base_counts.iloc[0]
+    top_base = top_base_row["Base"]
+    top_base_trips = int(top_base_row["trips"])
+    share_top_base = top_base_trips / base_counts["trips"].sum()
+
+    st.markdown(
+        f"""
+**Insights – Fleet / Base Utilisation**
+
+- The most active dispatch base in the filtered slice is **{top_base}** with
+  approximately **{top_base_trips:,} trips**, accounting for **{share_top_base:.1%}**
+  of all activity.
+- Concentration of volume in a few bases suggests opportunities to
+  **rebalance fleet supply** or **extend high-performing base practices**
+  to lower-volume locations.
+"""
     )
-    st.plotly_chart(fig_map, use_container_width=True)
-else:
-    st.info("No latitude/longitude columns found to plot the map.")
 
 st.markdown(
     """
-    ---
-    **Built by Linda Mthembu – Data Analyst & Project Manager**  
-    Explore the full notebook and code on my GitHub profile.
-    """
+---
+*Built by **Linda Mthembu – Data Analyst & Project Manager***  
+_This dashboard is powered by a sampled dataset saved to `data/uber-raw-data.csv`._
+"""
 )
