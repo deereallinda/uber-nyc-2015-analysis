@@ -302,7 +302,7 @@ if "Base" in filtered.columns:
 st.markdown(
     """
 ---
-*Built by **Linda Mthembu – Data Analyst & Project Manager***  
+*Built by **Linda Mthembu – Data Analyst & Junior Data Engineer***  
 _This dashboard is powered by a sampled dataset saved to `data/uber-raw-data.csv`._
 """
 )
