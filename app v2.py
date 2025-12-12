@@ -10,7 +10,9 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
 # I am always resolving the data path relative to this file,
 # so the app works no matter where Streamlit is launched from.
 APP_ROOT = Path(__file__).parent
